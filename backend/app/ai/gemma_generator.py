@@ -539,6 +539,7 @@ class GemmaTargetGenerator:
                     {"role": "user", "content": prompt},
                 ],
                 "max_completion_tokens": CLOUDFLARE_MAX_COMPLETION_TOKENS,
+                "temperature": temperature,
                 "chat_template_kwargs": {"enable_thinking": False},
             }
         else:

@@ -196,7 +196,7 @@ async def test_unanimous_approval_replaces_only_selected_unfinished_target(monke
     ]
     assert generated[0]["context"].locality == "Current District"
     assert generated[0]["count"] == 1
-    assert "backpack" not in generated[0]["excluded_classes"]
+    assert "backpack" in generated[0]["excluded_classes"]
 
 
 @pytest.mark.asyncio
@@ -335,6 +335,158 @@ async def test_concurrent_votes_finalize_replacement_once(monkeypatch):
     assert game.target_change_vote.status == "approved"
     assert len(generated) == 1
     assert sum(target.id == "replacement-id" for target in game.targets) == 1
+
+
+@pytest.mark.asyncio
+async def test_replacement_excludes_class_of_replaced_target_server_side(monkeypatch):
+    """Regression: replacement class is excluded server-side via supported_classes."""
+    game, players = make_game_and_players()
+    players[1].completed_targets.append("target-1")
+
+    # Capture the arguments passed to generate_targets
+    captured_kwargs = {}
+
+    async def capture_generate_targets(**kwargs):
+        captured_kwargs.update(kwargs)
+        # Return a valid alternative (dog) - backpack is excluded from supported_classes
+        return [
+            Target(
+                id="replacement-valid",
+                name="Dog",
+                class_name="dog",
+                hint="Valid replacement",
+            )
+        ]
+
+    generated = install_memory_repositories(monkeypatch, game, players)
+    monkeypatch.setattr(
+        "app.services.target_change_service.target_generator.generate_targets",
+        capture_generate_targets,
+    )
+
+    pending = await TargetChangeService.request(game.id, players[0].id, "target-0")
+    result = await TargetChangeService.cast_vote(
+        game.id,
+        pending.target_change_vote.proposal_id,
+        players[1].id,
+        True,
+    )
+
+    # Should succeed with valid replacement
+    assert result.target_change_vote.status == "approved"
+    assert result.targets[0].class_name == "dog"
+    # Verify server-side exclusion: backpack excluded from supported_classes
+    assert "backpack" not in captured_kwargs.get("supported_classes", set())
+    # backpack should also be in excluded_classes
+    assert "backpack" in captured_kwargs.get("excluded_classes", set())
+
+
+@pytest.mark.asyncio
+async def test_replacement_fails_when_no_valid_alternative_exists(monkeypatch):
+    """Regression: clear error when no valid alternative class exists."""
+    game, players = make_game_and_players(player_count=1)
+
+    # Only "backpack" is supported, but it's the class being replaced
+    # So alternatives = supported - completed_classes = empty set
+    monkeypatch.setattr(
+        "app.services.target_change_service.image_verifier.get_supported_target_classes",
+        lambda: ("backpack",),
+    )
+    monkeypatch.setattr(
+        "app.services.target_change_service.image_verifier.class_id_for_name",
+        lambda class_name: 24 if class_name == "backpack" else None,
+    )
+
+    # Set up minimal mocks without install_memory_repositories (which captures wrong supported_classes)
+    async def get_game(game_id):
+        return Game.model_validate(game.model_dump(by_alias=True)) if game_id == game.id else None
+
+    async def get_players(game_id):
+        return players if game_id == game.id else []
+
+    async def touch(game_id, player_id):
+        return game_id == game.id and any(item.id == player_id for item in players)
+
+    async def create_vote(game_id, vote):
+        if game_id != game.id or (
+            game.target_change_vote
+            and game.target_change_vote.status == "pending"
+        ):
+            return False
+        game.target_change_vote = TargetChangeVote.model_validate(vote.model_dump())
+        return True
+
+    async def update_vote(game_id, vote, expected_revision):
+        await asyncio.sleep(0)
+        current = game.target_change_vote
+        if (
+            game_id != game.id
+            or current is None
+            or current.status != "pending"
+            or current.proposal_id != vote.proposal_id
+            or current.revision != expected_revision
+        ):
+            return False
+        game.target_change_vote = TargetChangeVote.model_validate(vote.model_dump())
+        return True
+
+    async def finalize_vote(game_id, vote, expected_revision):
+        await asyncio.sleep(0)
+        current = game.target_change_vote
+        if (
+            game_id != game.id
+            or current is None
+            or current.status != "pending"
+            or current.proposal_id != vote.proposal_id
+            or current.revision != expected_revision
+        ):
+            return False
+        target_index = next(
+            (
+                index for index, target in enumerate(game.targets)
+                if target.id == vote.target_id
+            ),
+            None,
+        )
+        if target_index is None or vote.replacement_target is None:
+            return False
+        game.targets[target_index] = vote.replacement_target
+        game.target_change_vote = TargetChangeVote.model_validate(vote.model_dump())
+        return True
+
+    generated = []
+
+    async def generate_targets(**kwargs):
+        generated.append(kwargs)
+        # Generator would raise TargetGenerationError when no candidates available
+        from app.ai.gemma_generator import TargetGenerationError
+        raise TargetGenerationError("No supported YOLO classes available")
+
+    monkeypatch.setattr(settings, "DEMO_MODE", False)
+    monkeypatch.setattr(GameRepository, "get_by_id", get_game)
+    monkeypatch.setattr(GameRepository, "create_target_vote", create_vote)
+    monkeypatch.setattr(GameRepository, "update_pending_target_vote", update_vote)
+    monkeypatch.setattr(GameRepository, "finalize_target_vote", finalize_vote)
+    monkeypatch.setattr(PlayerRepository, "get_by_game", get_players)
+    monkeypatch.setattr(PlayerRepository, "touch_last_seen", touch)
+    monkeypatch.setattr(
+        "app.services.target_change_service.target_generator.generate_targets",
+        generate_targets,
+    )
+
+    pending = await TargetChangeService.request(game.id, players[0].id, "target-0")
+    result = await TargetChangeService.cast_vote(
+        game.id,
+        pending.target_change_vote.proposal_id,
+        players[0].id,
+        True,
+    )
+
+    # Should fail with unavailable status since no valid alternative
+    assert result.target_change_vote.status == "unavailable"
+    assert "supported" in result.target_change_vote.message.lower() or "classes" in result.target_change_vote.message.lower()
+    assert result.targets[0].id == "target-0"  # Original target unchanged
+    assert len(generated) == 1  # Generator was called but raised error
 
 
 @pytest.mark.asyncio

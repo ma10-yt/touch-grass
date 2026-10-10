@@ -195,6 +195,12 @@ class TargetChangeService:
                 for item in game.targets
                 if item.id in completed_ids
             )
+            # Also exclude the class of the target being replaced
+            replaced_target = next(
+                (item for item in game.targets if item.id == vote.target_id), None
+            )
+            if replaced_target:
+                completed_classes.add(replaced_target.class_name.casefold())
             alternatives = supported - completed_classes
             generated = await target_generator.generate_targets(
                 game_id=game.id,
