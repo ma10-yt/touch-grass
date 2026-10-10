@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#173b2b">
+    <meta name="description" content="An outdoor scavenger hunt for curious people. Find, photograph and verify the world around you.">
+    <title>Touch Grass — Find your outside</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+    <div id="app">
+        <header class="app-header">
+            <a class="brand-lockup" href="#" onclick="showScreen('screen-landing'); return false;" aria-label="Touch Grass home">
+                <span class="brand-mark" aria-hidden="true">
+                    <svg viewBox="0 0 32 32" fill="none">
+                        <path d="M25.9 5.8C15.7 5.8 7.8 9.7 7.8 17.2c0 4.4 3.2 7.1 7.2 7.1 7.6 0 10.9-8.7 10.9-18.5Z" fill="currentColor"/>
+                        <path d="M5 27c3.1-5.2 7.8-8.9 14.2-12.2" stroke="#F7F5EC" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                </span>
+                <span>touch grass<span class="brand-period">.</span></span>
+            </a>
+            <span class="header-note"><span class="header-dot"></span> A little outside looks good on you</span>
+        </header>
+
+        <div class="global-status">
+            <p id="runtime-mode" class="mode-banner">Checking game mode…</p>
+            <p id="context-status" class="context-status" hidden></p>
+            <small id="osm-attribution" class="osm-attribution" hidden>
+                Map data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap contributors</a>
+            </small>
+        </div>
+
+        <main>
+            <section id="screen-landing" class="screen landing-screen active" aria-labelledby="landing-title">
+                <div class="hero-copy">
+                    <p class="eyebrow"><span class="eyebrow-marker"></span> YOUR NEXT LITTLE ADVENTURE</p>
+                    <h1 id="landing-title">Find your<br><em>outside.</em></h1>
+                    <p class="hero-description">A real-world scavenger hunt for curious people. Follow the clues, spot the everyday extraordinary, and snap a photo to prove you found it.</p>
+                    <div class="actions hero-actions">
+                        <button class="button-primary button-large" type="button" onclick="showScreen('screen-create')">
+                            <span class="button-icon" aria-hidden="true">↗</span> Create New Game
+                        </button>
+                        <button class="button-secondary button-large" type="button" onclick="showScreen('screen-join')">Join a game <span aria-hidden="true">→</span></button>
+                        <button id="btn-resume" class="secondary" onclick="restoreGameSession()" hidden>Resume previous game</button>
+                    </div>
+                    <div class="hero-facts" aria-label="Game features">
+                        <span><i aria-hidden="true">01</i> Five things to find</span>
+                        <span><i aria-hidden="true">02</i> Made for the real world</span>
+                    </div>
+                </div>
+                <div class="hero-art" role="img" aria-label="Illustration of a winding trail through a forest">
+                    <div class="sun-disc"></div>
+                    <div class="hill hill-back"></div>
+                    <div class="hill hill-front"></div>
+                    <div class="trail-path"></div>
+                    <span class="trail-pin pin-one"><b>1</b></span>
+                    <span class="trail-pin pin-two"><b>2</b></span>
+                    <span class="trail-pin pin-three"><b>✦</b></span>
+                    <span class="art-caption"><span class="caption-line"></span> THE WORLD IS YOUR PLAYGROUND</span>
+                    <svg class="hero-leaf leaf-left" viewBox="0 0 80 110" aria-hidden="true"><path d="M69 5C32 12 8 34 12 62c3 20 20 29 36 20C68 65 73 32 69 5Z" fill="currentColor"/><path d="M8 105c12-27 27-48 53-76" fill="none" stroke="#e9e6d9" stroke-width="3" stroke-linecap="round"/></svg>
+                    <svg class="hero-leaf leaf-right" viewBox="0 0 80 110" aria-hidden="true"><path d="M69 5C32 12 8 34 12 62c3 20 20 29 36 20C68 65 73 32 69 5Z" fill="currentColor"/><path d="M8 105c12-27 27-48 53-76" fill="none" stroke="#e9e6d9" stroke-width="3" stroke-linecap="round"/></svg>
+                </div>
+                <div class="landing-footnote"><span class="footnote-symbol">✳</span> No rush. No route. Just look a little closer.</div>
+            </section>
+
+            <section id="screen-create" class="screen form-screen" aria-labelledby="create-title">
+                <div class="screen-heading">
+                    <p class="eyebrow"><span class="eyebrow-marker"></span> START SOMETHING</p>
+                    <h1 id="create-title">Make a little<br><em>adventure.</em></h1>
+                    <p>Pick a name and we’ll set up a fresh game around your current area.</p>
+                </div>
+                <label class="field-label" for="create-name">Your name</label>
+                <input type="text" id="create-name" placeholder="What should we call you?" autocomplete="nickname" maxlength="40">
+                <button id="btn-create" class="button-primary button-large" type="button" onclick="createGame()">Create New Game <span aria-hidden="true">→</span></button>
+                <p id="create-status" class="status-msg" role="status" aria-live="polite"></p>
+                <button class="button-quiet back-button" type="button" onclick="showScreen('screen-landing')"><span aria-hidden="true">←</span> Back to home</button>
+            </section>
+
+            <section id="screen-join" class="screen form-screen" aria-labelledby="join-title">
+                <div class="screen-heading">
+                    <p class="eyebrow"><span class="eyebrow-marker"></span> MEET YOU OUT THERE</p>
+                    <h1 id="join-title">Join the<br><em>adventure.</em></h1>
+                    <p>Enter the game code your teammate shared with you.</p>
+                </div>
+                <label class="field-label" for="join-name">Your name</label>
+                <input type="text" id="join-name" placeholder="What should we call you?" autocomplete="nickname" maxlength="40">
+                <label class="field-label" for="join-code">Game code</label>
+                <input type="text" id="join-code" placeholder="e.g. A7K2Q" autocomplete="off" autocapitalize="characters" maxlength="8" style="text-transform: uppercase;">
+                <button class="button-primary button-large" type="button" onclick="joinGame()">Join game <span aria-hidden="true">→</span></button>
+                <button class="button-quiet back-button" type="button" onclick="showScreen('screen-landing')"><span aria-hidden="true">←</span> Back to home</button>
+            </section>
+
+            <section id="screen-lobby" class="screen lobby-screen" aria-labelledby="lobby-title">
+                <div class="screen-heading">
+                    <p class="eyebrow"><span class="eyebrow-marker"></span> YOUR CREW IS GATHERING</p>
+                    <h1 id="lobby-title">Meet at the<br><em>trailhead.</em></h1>
+                    <p id="lobby-status">Share your code and bring your people along.</p>
+                </div>
+                <div class="lobby-code-card">
+                    <span class="field-label">YOUR GAME CODE</span>
+                    <div class="lobby-code-row">
+                        <strong id="lobby-code">...</strong>
+                        <button id="btn-copy-code" class="copy-button" type="button" onclick="copyGameCode()" aria-label="Copy game code">Copy code</button>
+                    </div>
+                    <span id="copy-status" class="copy-status" role="status" aria-live="polite"></span>
+                </div>
+                <div class="lobby-players-card">
+                    <div class="section-title-row">
+                        <h2>Who's coming?</h2>
+                        <span id="lobby-player-count" class="player-count">0 players</span>
+                    </div>
+                    <ul id="lobby-players" class="player-list"></ul>
+                </div>
+                <button id="btn-start" class="button-primary button-large" type="button" onclick="startGame()" style="display:none;">Start the game <span aria-hidden="true">→</span></button>
+                <button class="button-quiet back-button" onclick="leaveGame()">Leave Game</button>
+            </section>
+
+            <section id="screen-active" class="screen active-game-screen" aria-label="Active scavenger hunt">
+                <div class="game-topbar">
+                    <div class="game-location">
+                        <span class="location-marker" aria-hidden="true">⌖</span>
+                        <span id="loc-status" aria-live="polite">Location: finding...</span>
+                    </div>
+                    <span id="score" class="score-pill">Score: 0</span>
+                </div>
+                <button id="btn-retry-location" class="button-quiet retry-button" type="button" onclick="retryLocationTracking()">↻ Retry GPS</button>
+                <div class="game-progress-card">
+                    <div class="progress-copy">
+                        <span class="eyebrow">YOUR HUNT</span>
+                        <p id="progress" aria-live="polite">Progress: 0%</p>
+                    </div>
+                    <div class="progress-track" aria-hidden="true"><span class="progress-fill"></span></div>
+                    <span class="progress-caption">Every verified find brings you closer.</span>
+                </div>
+
+                <section class="activity-stats" aria-labelledby="activity-heading">
+                    <div class="activity-heading-row">
+                        <div>
+                            <p class="eyebrow">OUT HERE</p>
+                            <h2 id="activity-heading">Your trail stats</h2>
+                        </div>
+                        <span class="activity-icon" aria-hidden="true">✳</span>
+                    </div>
+                    <div class="activity-metrics">
+                        <div class="activity-metric">
+                            <span class="metric-label">ESTIMATED STEPS</span>
+                            <p id="step-count">0 estimated steps</p>
+                        </div>
+                        <div class="activity-metric">
+                            <span class="metric-label">GPS DISTANCE</span>
+                            <p id="gps-distance">GPS distance: unavailable (need consecutive fixes ≤15 m accuracy)</p>
+                        </div>
+                        <div class="activity-metric step-distance-metric">
+                            <span class="metric-label">STEP-BASED ESTIMATE</span>
+                            <p id="step-distance">Step-distance estimate: ~0 m (using 0.75 m/step; adjust stride above)</p>
+                        </div>
+                    </div>
+                    <div class="activity-controls">
+                        <button id="btn-step-counter" class="button-secondary button-compact" type="button" onclick="toggleStepCounter()">Start Step Counter</button>
+                        <label class="stride-control" for="stride-length">
+                            <span>Stride (m)</span>
+                            <input id="stride-length" type="number" min="0.30" max="1.50" step="0.01" value="0.75" oninput="renderActivityStats()">
+                        </label>
+                    </div>
+                    <p id="step-status" class="status-msg" role="status" aria-live="polite">Step counter not started. This is an estimated count, not a certified pedometer.</p>
+                </section>
+
+                <section class="targets-section" aria-labelledby="targets-heading">
+                    <div class="section-title-row targets-title-row">
+                        <div>
+                            <p class="eyebrow">LOOK AROUND YOU</p>
+                            <h2 id="targets-heading">Things to find</h2>
+                        </div>
+                        <span class="trail-stamp" aria-hidden="true">✦</span>
+                    </div>
+                    <p class="vote-explainer">
+                        Stuck on a target? Your team can request a change. Everyone active in the last 90 seconds must approve; rejection cancels it. A replacement never grants progress.
+                    </p>
+                    <ul id="target-list" class="checklist" aria-live="polite"></ul>
+                </section>
+
+                <div id="camera-section">
+                    <dialog id="camera-modal" class="camera-modal" aria-labelledby="camera-target" hidden>
+                        <p class="eyebrow camera-eyebrow">LINE UP YOUR FIND</p>
+                        <p id="camera-target"></p>
+                        <video id="camera-preview" autoplay playsinline aria-label="Live camera preview"></video>
+                        <div class="camera-controls">
+                            <button id="camera-switch" class="button-secondary" type="button" onclick="switchCamera()" hidden>Switch camera</button>
+                            <button id="camera-capture" class="button-primary button-large" type="button" onclick="capturePhoto()">Capture photo</button>
+                            <button class="button-quiet" type="button" onclick="cancelCamera()">Cancel</button>
+                        </div>
+                    </dialog>
+                </div>
+
+                <div id="upload-status" class="status-msg feedback-message" role="status" aria-live="polite"></div>
+                <div class="game-footer-actions">
+                    <button class="button-secondary" type="button" onclick="showScreen('screen-leaderboard')">View team leaderboard</button>
+                    <button class="button-quiet" type="button" onclick="leaveGame()">Leave game</button>
+                </div>
+            </section>
+
+            <section id="screen-leaderboard" class="screen leaderboard-screen" aria-labelledby="leaderboard-title">
+                <div class="screen-heading">
+                    <p class="eyebrow"><span class="eyebrow-marker"></span> YOUR CREW</p>
+                    <h1 id="leaderboard-title">The team<br><em>so far.</em></h1>
+                </div>
+                <ul id="leaderboard-list" class="player-list leaderboard-list"></ul>
+                <button class="button-secondary" type="button" onclick="showScreen('screen-active')">Back to the hunt</button>
+                <button class="button-quiet back-button" type="button" onclick="leaveGame()">Leave game</button>
+            </section>
+
+            <section id="screen-winner" class="screen winner-screen" aria-labelledby="winner-title">
+                <div class="celebration-orbit" aria-hidden="true"><span>✦</span><span>✳</span><span>✧</span></div>
+                <p class="eyebrow"><span class="eyebrow-marker"></span> THE HUNT IS COMPLETE</p>
+                <h1 id="winner-title">You found<br><em>your outside.</em></h1>
+                <p id="winner-name" class="winner-name">...</p>
+                <div class="winner-summary">
+                    <h2>Your verified finds</h2>
+                    <ul id="winner-targets" class="winner-targets"></ul>
+                    <div id="winner-activity" class="winner-activity"></div>
+                </div>
+                <button class="button-primary button-large" type="button" onclick="leaveGame()">Back to the trailhead <span aria-hidden="true">→</span></button>
+            </section>
+        </main>
+        <footer class="app-footer"><span class="footer-sprig" aria-hidden="true">⌁</span> Made for the joy of looking closer.</footer>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

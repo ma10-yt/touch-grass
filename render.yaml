@@ -1,0 +1,48 @@
+services:
+  - type: web
+    name: touch-grass-api
+    runtime: python
+    plan: 1c-2g
+    region: oregon
+    buildCommand: >-
+      pip install -r backend/requirements.txt &&
+      python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+    startCommand: PYTHONPATH=backend uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: false
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DATABASE
+        value: touch_grass
+      - key: DEMO_MODE
+        value: "false"
+      - key: GEMMA_MODEL
+        value: gemma3:1b
+      - key: YOLO_MODEL
+        value: yolov8n.pt
+      - key: OLLAMA_URL
+        fromService:
+          type: pserv
+          name: touch-grass-ollama
+          property: hostport
+      - key: GEOCONTEXT_USER_AGENT
+        sync: false
+
+  - type: pserv
+    name: touch-grass-ollama
+    runtime: docker
+    plan: 2c-4g
+    region: oregon
+    dockerfilePath: ./deploy/ollama/Dockerfile
+    dockerContext: .
+    autoDeploy: false
+    disk:
+      name: ollama-models
+      mountPath: /root/.ollama
+      sizeGB: 5
+    envVars:
+      - key: OLLAMA_HOST
+        value: 0.0.0.0:11434
