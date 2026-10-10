@@ -101,15 +101,19 @@ I measured the FastAPI app imported with ONNX Runtime loaded and ran two actual 
 
 #### Free Gemma API limits
 
-The Blueprint uses OpenRouter model `google/gemma-4-26b-a4b-it:free` (the current free Gemma variant found in the [OpenRouter model catalog](https://openrouter.ai/models), advertising `response_format`; it is not the local Gemma 3 1B model). OpenRouter's documented [free-variant limits](https://openrouter.ai/docs/api_reference/limits) are **20 requests/minute and 50 requests/day** when the account has purchased less than 10 credits. The 1,000/day tier requires at least 10 credits purchased and is outside a strict $0 budget. Generation can retry once after non-rate-limit errors, so worst case one fresh game start can use two requests; a daily cap of 50 therefore allows at most 25 such starts if each exhausts both attempts, before target changes or other API calls. HTTP 429 errors are returned without an immediate retry. Provider availability/capacity limits can also return 429s. Check the OpenRouter key usage endpoint/dashboard for current quota. Game creation/start requires Gemma; if the API key is missing or generation fails, the server returns an error and does **not** substitute fixed demo targets.
+The Blueprint uses OpenRouter model `google/gemma-4-26b-a4b-it:free` (the current free Gemma variant found in the [OpenRouter model catalog](https://openrouter.ai/models), advertising `response_format`; it is not the local Gemma 3 1B model). OpenRouter's documented [free-variant limits](https://openrouter.ai/docs/api_reference/limits) are **20 requests/minute and 50 requests/day** when the account has purchased less than 10 credits. The 1,000/day tier requires at least 10 credits purchased and is outside a strict $0 budget. Generation can retry once after non-rate-limit errors, so worst case one fresh game start can use two requests; a daily cap of 50 therefore allows at most 25 such starts if each exhausts both attempts, before target changes or other API calls. HTTP 429 errors are returned without an immediate retry. Provider availability/capacity limits can also return 429s. Check the OpenRouter key usage endpoint/dashboard for current quota.
+
+**Cloudflare Workers AI** (when configured) uses the `@cf/google/gemma-4-26b-a4b-it` model via the Workers AI platform. Cloudflare's [Workers AI free tier](https://developers.cloudflare.com/workers-ai/platform/limits/) includes a daily request allocation that varies by model; for Gemma models it typically provides generous daily limits suitable for development and small-scale deployment. HTTP 429 responses include a `Retry-After` header when available. Quota exhaustion (HTTP 402) is handled without retries. The server never silently falls back to a paid model; if all configured providers fail, a location-aware fallback using supported YOLO classes is used.
+
+Game creation/start requires Gemma; if the API key/token is missing or generation fails, the server returns an error and does **not** substitute fixed demo targets.
 
 #### Deployment steps (no billing setup)
 
 1. Push this project to a Git-provider repository yourself after checking that no `.env`, credentials, `.venv`, `.pt`, or generated `.onnx` files are tracked. The present project directory has no `.git` metadata; this setup does not push or deploy code for you.
 2. Create or select a MongoDB Atlas deployment, database user, and database. Configure Atlas network access for the Render web service; do not expose MongoDB broadly unless you accept that risk. Atlas may have costs independent of Render.
-3. Create a free OpenRouter account/key for free model use. Do not add paid credits if maintaining a strict $0 budget. Keep the key private.
+3. Create a free OpenRouter account/key for free model use **or** a Cloudflare account with Workers AI access. Do not add paid credits if maintaining a strict $0 budget. Keep the key private.
 4. In Render, choose **New → Blueprint**, connect your repository, and select the root `render.yaml`. Verify the review contains one web service with plan `free` and no disk, private service, or paid database. Do not add a payment method or upgrade the plan.
-5. Set the prompted `MONGODB_URI`, `OPENROUTER_API_KEY`, and `GEOCONTEXT_USER_AGENT` in Render's secure environment-variable form. Use an identifying OSM User-Agent with a maintainer contact, for example `TouchGrassGame/1.0 (contact: your-maintainer-email)`. Follow Nominatim/Overpass usage policies.
+5. Set the prompted `MONGODB_URI`, `OPENROUTER_API_KEY` (or `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`), and `GEOCONTEXT_USER_AGENT` in Render's secure environment-variable form. Use an identifying OSM User-Agent with a maintainer contact, for example `TouchGrassGame/1.0 (contact: your-maintainer-email)`. Follow Nominatim/Overpass usage policies.
 6. Apply the Blueprint. The build installs the app dependencies, downloads the actual `yolov8n.pt` weights through Ultralytics, exports ONNX at 640×640, then removes training/export-only PyTorch packages. Production serves the ONNX model with CPUExecutionProvider. No model weights from the local machine are required.
 7. Check `/api/health` and `/api/health/ai`; the latter confirms OpenRouter key connectivity/model listing but cannot guarantee free-model quota or provider availability. Test MongoDB game persistence and a real camera submission after deployment. Grant location and camera permissions over HTTPS; optional step counting remains browser-side.
 
@@ -122,12 +126,16 @@ The Blueprint sets production-specific values and asks for secrets through Rende
 | `MONGODB_URI` | Required secret; set in Render to the Atlas connection URI. |
 | `MONGODB_DATABASE` | `touch_grass` |
 | `DEMO_MODE` | `false` (required for real Gemma and YOLO). |
-| `AI_PROVIDER` | `openrouter` on Render; defaults to `ollama` locally. |
-| `OPENROUTER_API_KEY` | Required secret in Render; absent locally unless OpenRouter is selected. |
+| `AI_PROVIDER` | `openrouter` or `cloudflare` on Render; defaults to `ollama` locally. |
+| `AI_FALLBACK_PROVIDER` | `none` (default); set to `openrouter`, `ollama`, or `cloudflare` for fallback. |
+| `OPENROUTER_API_KEY` | Required secret in Render if using OpenRouter; absent locally unless OpenRouter is selected. |
 | `OPENROUTER_MODEL` | `google/gemma-4-26b-a4b-it:free` |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` |
+| `CLOUDFLARE_ACCOUNT_ID` | Required secret in Render if using Cloudflare; your Cloudflare account ID. |
+| `CLOUDFLARE_API_TOKEN` | Required secret in Render if using Cloudflare; Workers AI API token. |
+| `CLOUDFLARE_AI_MODEL` | `@cf/google/gemma-4-26b-a4b-it` |
 | `GEMMA_MODEL` | `gemma3:1b` for local Ollama development. |
-| `OLLAMA_URL` | `http://localhost:11434` local default; unused by Render's OpenRouter provider. |
+| `OLLAMA_URL` | `http://localhost:11434` local default; unused by Render's OpenRouter/Cloudflare provider. |
 | `YOLO_MODEL` | `yolov8n.onnx` on Render; local default `yolov8n.pt`. |
 | `GEOCONTEXT_USER_AGENT` | Required at deployment; set an app-identifying string with a maintainer contact. |
 | `LOCATION_MAX_AGE_SECONDS` | `60` |

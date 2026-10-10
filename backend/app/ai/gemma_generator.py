@@ -2,6 +2,7 @@ import json
 import hashlib
 import logging
 import uuid
+import asyncio
 from typing import Any, Optional
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -25,6 +26,10 @@ DEMO_TARGETS = (
     ("Car", "car", "Look along a public street."),
     ("Backpack", "backpack", "Look for someone carrying one in a public place."),
 )
+
+CLOUDFLARE_MAX_COMPLETION_TOKENS = 1024
+CLOUDFLARE_TIMEOUT = httpx.Timeout(45.0, connect=10.0)
+MAX_RETRY_AFTER_SECONDS = 60
 
 CATEGORY_SCORES = {
     "parks_and_recreation": {
@@ -78,6 +83,20 @@ class GemmaModelUnavailable(TargetGenerationError):
 
 
 class GemmaRateLimited(TargetGenerationError):
+    def __init__(self, message: str, retry_after: Optional[int] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class GemmaQuotaExhausted(TargetGenerationError):
+    pass
+
+
+class GemmaCredentialsInvalid(TargetGenerationError):
+    pass
+
+
+class GemmaTransientError(TargetGenerationError):
     pass
 
 
@@ -126,14 +145,23 @@ class GemmaTargetList(BaseModel):
 class GemmaTargetGenerator:
     def __init__(self) -> None:
         self.provider = settings.AI_PROVIDER
-        if self.provider == "openrouter":
-            self.model = settings.OPENROUTER_MODEL
-            self.base_url = settings.OPENROUTER_BASE_URL.rstrip("/")
-            self.url = f"{self.base_url}/chat/completions"
-        else:
-            self.model = settings.GEMMA_MODEL
-            self.base_url = settings.OLLAMA_URL.rstrip("/")
-            self.url = f"{self.base_url}/api/chat"
+        self.model, self.url = self._provider_model_and_url(self.provider)
+
+    @staticmethod
+    def _provider_model_and_url(provider: str) -> tuple[str, str]:
+        if provider == "cloudflare":
+            return (
+                settings.CLOUDFLARE_AI_MODEL,
+                "https://api.cloudflare.com/client/v4/accounts/"
+                f"{settings.CLOUDFLARE_ACCOUNT_ID}/ai/run/"
+                f"{settings.CLOUDFLARE_AI_MODEL}",
+            )
+        if provider == "openrouter":
+            return (
+                settings.OPENROUTER_MODEL,
+                f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions",
+            )
+        return settings.GEMMA_MODEL, f"{settings.OLLAMA_URL.rstrip('/')}/api/chat"
 
     async def generate_targets(
         self,
@@ -207,59 +235,197 @@ class GemmaTargetGenerator:
         schema["$defs"]["GemmaTarget"]["properties"]["class_name"]["enum"] = candidates
         schema["properties"]["targets"]["minItems"] = count
         schema["properties"]["targets"]["maxItems"] = count
-        for attempt in range(2):
-            prompt = self._build_prompt(
-                game_id,
-                context,
-                candidate_pool,
-                count=count,
-                simplified=attempt == 1,
-            )
-            try:
-                structured_targets = await self._request_targets(
-                    prompt,
-                    schema,
-                    temperature=0.2 if attempt == 0 else 0.0,
-                    game_id=game_id,
-                    attempt=attempt + 1,
-                    allowed_classes=set(candidates),
+        providers = [(self.provider, self.model, self.url)]
+        fallback_provider = settings.AI_FALLBACK_PROVIDER
+        if fallback_provider != "none" and fallback_provider != self.provider:
+            fallback_model, fallback_url = self._provider_model_and_url(fallback_provider)
+            providers.append((fallback_provider, fallback_model, fallback_url))
+
+        provider_failures: list[tuple[str, TargetGenerationError]] = []
+        for provider, model, url in providers:
+            for attempt in range(2):
+                prompt = self._build_prompt(
+                    game_id,
+                    context,
+                    candidate_pool,
                     count=count,
+                    simplified=attempt == 1,
                 )
-                if len(structured_targets.targets) != count:
-                    raise TargetGenerationError(
-                        f"Gemma returned an unexpected number of targets (expected {count})."
+                try:
+                    structured_targets = await self._request_targets(
+                        prompt,
+                        schema,
+                        temperature=0.2 if attempt == 0 else 0.0,
+                        game_id=game_id,
+                        attempt=attempt + 1,
+                        allowed_classes=set(candidates),
+                        count=count,
+                        provider=provider,
+                        model=model,
+                        url=url,
                     )
-                targets = [
-                    Target(
-                        id=str(uuid.uuid4()),
-                        name=item.class_name.title(),
-                        class_name=item.class_name,
-                        hint=item.hint,
+                    if len(structured_targets.targets) != count:
+                        raise TargetGenerationError(
+                            f"Gemma returned an unexpected number of targets (expected {count})."
+                        )
+                    targets = [
+                        Target(
+                            id=str(uuid.uuid4()),
+                            name=item.class_name.title(),
+                            class_name=item.class_name,
+                            hint=item.hint,
+                        )
+                        for item in structured_targets.targets
+                    ]
+                    logger.info(
+                        "Gemma selected target classes game=%s provider=%s targets=%s",
+                        game_id,
+                        provider,
+                        [target.class_name for target in targets],
                     )
-                    for item in structured_targets.targets
-                ]
-                logger.info(
-                    "Gemma selected target classes game=%s targets=%s",
-                    game_id,
-                    [target.class_name for target in targets],
+                    return targets
+                except GemmaQuotaExhausted as exc:
+                    provider_failures.append((provider, exc))
+                    logger.warning(
+                        "Gemma provider quota exhausted game=%s provider=%s",
+                        game_id,
+                        provider,
+                    )
+                    break
+                except GemmaCredentialsInvalid as exc:
+                    provider_failures.append((provider, exc))
+                    logger.warning(
+                        "Gemma provider credentials rejected game=%s provider=%s",
+                        game_id,
+                        provider,
+                    )
+                    break
+                except GemmaRateLimited as exc:
+                    provider_failures.append((provider, exc))
+                    retry_after = getattr(exc, "retry_after", None)
+                    if retry_after is not None and retry_after <= MAX_RETRY_AFTER_SECONDS:
+                        logger.warning(
+                            "Gemma provider rate limited; waiting %ss before retry game=%s provider=%s attempt=%s",
+                            retry_after,
+                            game_id,
+                            provider,
+                            attempt + 1,
+                        )
+                        await asyncio.sleep(retry_after)
+                        # Continue to next attempt
+                        if attempt == 1:
+                            break
+                        continue
+                    elif retry_after is not None and retry_after > MAX_RETRY_AFTER_SECONDS:
+                        logger.warning(
+                            "Gemma provider capacity limited game=%s provider=%s attempt=%s retry_after=%s; skipping retry",
+                            game_id,
+                            provider,
+                            attempt + 1,
+                            retry_after,
+                        )
+                        # For long delays (>60s), skip retry and move to fallback
+                        break
+                    else:
+                        # No Retry-After header: bounded retry (once)
+                        logger.warning(
+                            "Gemma provider capacity limited game=%s provider=%s attempt=%s; no Retry-After header, bounded retry",
+                            game_id,
+                            provider,
+                            attempt + 1,
+                        )
+                        if attempt == 1:
+                            break
+                        continue
+                except TargetGenerationError as exc:
+                    provider_failures.append((provider, exc))
+                    logger.warning(
+                        "Structured Gemma attempt failed game=%s provider=%s "
+                        "attempt=%s error_type=%s",
+                        game_id,
+                        provider,
+                        attempt + 1,
+                        type(exc).__name__,
+                    )
+                    if attempt == 1:
+                        break
+
+        failure_types = sorted({type(error).__name__ for _, error in provider_failures})
+        logger.warning(
+            "AI target generation unavailable; using supported location-ranked "
+            "targets game=%s failed_providers=%s failure_types=%s",
+            game_id,
+            [provider for provider, _ in provider_failures],
+            failure_types,
+        )
+        fallback_targets = self._build_ranked_fallback_targets(candidate_pool, count, game_id)
+        if len(fallback_targets) != count:
+            raise TargetGenerationError(
+                "AI providers failed and there are not enough distinct supported "
+                "YOLO classes for safe fallback targets."
+            )
+        notice = (
+            "AI target generation is temporarily unavailable. Tasks were selected "
+            "from location-ranked classes supported by the active image detector."
+        )
+        context.notice = f"{context.notice} {notice}".strip()
+        logger.info(
+            "Location-ranked fallback targets game=%s targets=%s",
+            game_id,
+            [target.class_name for target in fallback_targets],
+        )
+        return fallback_targets
+
+    @staticmethod
+    def _build_ranked_fallback_targets(
+        candidates: list[TargetCandidate],
+        count: int,
+        game_id: str,
+    ) -> list[Target]:
+        """
+        Build fallback targets with meaningful variation.
+
+        Selects from top-ranked candidates using game_id for deterministic but varied
+        selection. Prefers highly-ranked candidates for the current area while ensuring
+        variety across different game sessions.
+        """
+        if len(candidates) < count:
+            raise TargetGenerationError(
+                "Not enough supported YOLO classes for fallback targets."
+            )
+
+        # Group candidates by score to find similarly-suitable candidates
+        # We'll select from the top tier with variation based on game_id
+        scored_candidates = [(c.score, c) for c in candidates]
+        scored_candidates.sort(key=lambda x: (-x[0], hashlib.sha256(f"{game_id}:{x[1].class_name}".encode()).hexdigest()))
+
+        # Take top candidates, but if there are ties in score, use game_id to vary selection
+        targets: list[Target] = []
+        selected_classes: set[str] = set()
+
+        # First pass: pick highest scoring candidates, using game_id for tie-breaking
+        for score, candidate in scored_candidates:
+            if len(targets) >= count:
+                break
+            if candidate.class_name in selected_classes:
+                continue
+            reason = candidate.reasons[0] if candidate.reasons else ""
+            hint = (
+                f"Look for this object in a public outdoor area suited to {reason}."
+                if reason
+                else "Look for this common object in a public outdoor area."
+            )
+            targets.append(
+                Target(
+                    id=str(uuid.uuid4()),
+                    name=candidate.class_name.title(),
+                    class_name=candidate.class_name,
+                    hint=hint,
                 )
-                return targets
-            except GemmaModelUnavailable:
-                raise
-            except GemmaRateLimited:
-                raise
-            except TargetGenerationError as exc:
-                logger.warning(
-                    "Structured Gemma attempt %s failed for game %s: %s",
-                    attempt + 1,
-                    game_id,
-                    exc,
-                )
-                if attempt == 1:
-                    raise TargetGenerationError(
-                        f"{self.provider.title()} Gemma target generation is unavailable or returned invalid output after two attempts: {exc}"
-                    ) from exc
-        raise TargetGenerationError(f"{self.provider.title()} Gemma target generation failed.")
+            )
+            selected_classes.add(candidate.class_name)
+
+        return targets
 
     @staticmethod
     def rank_candidates(
@@ -326,62 +492,146 @@ class GemmaTargetGenerator:
         attempt: int,
         allowed_classes: set[str],
         count: int = 5,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        url: Optional[str] = None,
     ) -> GemmaTargetList:
-        if self.provider == "openrouter" and not settings.OPENROUTER_API_KEY:
+        provider = provider or self.provider
+        model = model or self.model
+        url = url or self.url
+        if provider == "openrouter" and not settings.OPENROUTER_API_KEY:
             raise GemmaModelUnavailable(
                 "OpenRouter is selected but OPENROUTER_API_KEY is not configured."
             )
+        if provider == "cloudflare" and (
+            not settings.CLOUDFLARE_ACCOUNT_ID or not settings.CLOUDFLARE_API_TOKEN
+        ):
+            raise GemmaModelUnavailable(
+                "Cloudflare is selected but CLOUDFLARE_ACCOUNT_ID and "
+                "CLOUDFLARE_API_TOKEN must be configured."
+            )
         headers: dict[str, str] = {}
-        request_body: dict[str, Any] = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-            "temperature": temperature,
-        }
-        if self.provider == "openrouter":
+        request_body: dict[str, Any] = {}
+        if provider == "openrouter":
             headers["Authorization"] = f"Bearer {settings.OPENROUTER_API_KEY}"
-            request_body["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "gemma_target_list",
-                    "strict": True,
-                    "schema": schema,
+            request_body = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": self._build_system_prompt(count)},
+                    {"role": "user", "content": prompt},
+                ],
+                "stream": False,
+                "temperature": temperature,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "gemma_target_list",
+                        "strict": True,
+                        "schema": schema,
+                    },
                 },
             }
+        elif provider == "cloudflare":
+            headers["Authorization"] = f"Bearer {settings.CLOUDFLARE_API_TOKEN}"
+            request_body = {
+                "messages": [
+                    {"role": "system", "content": self._build_system_prompt(count)},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_completion_tokens": CLOUDFLARE_MAX_COMPLETION_TOKENS,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
         else:
-            request_body["format"] = schema
-            request_body["options"] = {"temperature": temperature}
+            request_body = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "temperature": temperature,
+                "format": schema,
+                "options": {"temperature": temperature},
+            }
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            async with httpx.AsyncClient(timeout=CLOUDFLARE_TIMEOUT) as client:
                 response = await client.post(
-                    self.url,
+                    url,
                     json=request_body,
                     headers=headers,
                 )
         except httpx.HTTPError as exc:
             logger.warning(
                 "%s chat request failed game=%s attempt=%s error_type=%s",
-                self.provider,
+                provider,
                 game_id,
                 attempt,
                 type(exc).__name__,
             )
-            raise TargetGenerationError(
-                f"Could not connect to the configured {self.provider} service."
+            raise GemmaTransientError(
+                f"Could not connect to the configured {provider} service."
             ) from exc
 
         logger.info(
             "%s chat response game=%s attempt=%s status=%s",
-            self.provider,
+            provider,
             game_id,
             attempt,
             response.status_code,
         )
-        if self.provider == "openrouter" and response.status_code == 429:
+
+        if provider == "openrouter" and response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            delay = None
+            if retry_after:
+                try:
+                    delay = int(retry_after)
+                except ValueError:
+                    delay = None
             raise GemmaRateLimited(
-                "OpenRouter rate limit or provider capacity was reached. Please try again later."
+                "OpenRouter rate limit or provider capacity was reached. Please try again later.",
+                retry_after=delay,
             )
-        if self.provider == "ollama" and response.status_code == 404:
+        if provider == "cloudflare":
+            if response.status_code == 401:
+                raise GemmaCredentialsInvalid(
+                    "Cloudflare API token is invalid or lacks Workers AI permissions."
+                )
+            if response.status_code == 403:
+                raise GemmaCredentialsInvalid(
+                    "Cloudflare API token is forbidden for this account or model."
+                )
+            if response.status_code == 429:
+                # Check response body first for quota indicators
+                try:
+                    payload = response.json()
+                    if not payload.get("success", False):
+                        errors = payload.get("errors", [])
+                        error_messages = "; ".join(
+                            e.get("message", str(e)) for e in errors
+                        ) if errors else "Unknown Cloudflare error"
+                        if "quota" in error_messages.casefold() or "allocation" in error_messages.casefold():
+                            raise GemmaQuotaExhausted(
+                                "Cloudflare Workers AI daily free allocation exhausted. "
+                                "Check your account quota at https://dash.cloudflare.com."
+                            )
+                except (ValueError, AttributeError):
+                    pass
+                # Not a quota error - treat as rate limit
+                retry_after = response.headers.get("Retry-After")
+                delay = None
+                if retry_after:
+                    try:
+                        delay = int(retry_after)
+                    except ValueError:
+                        delay = None
+                raise GemmaRateLimited(
+                    "Cloudflare rate limit or provider capacity was reached. Please try again later.",
+                    retry_after=delay,
+                )
+            if response.status_code == 402:
+                raise GemmaQuotaExhausted(
+                    "Cloudflare Workers AI daily free allocation exhausted. "
+                    "Check your account quota at https://dash.cloudflare.com."
+                )
+        if provider == "ollama" and response.status_code == 404:
             try:
                 error_body = response.json()
                 error_text = str(error_body.get("error", ""))
@@ -398,35 +648,70 @@ class GemmaTargetGenerator:
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise TargetGenerationError(
-                f"{self.provider.title()} returned HTTP {response.status_code} or invalid response JSON."
+                f"{provider.title()} returned HTTP {response.status_code} or invalid response JSON."
             ) from exc
 
         content: Any = None
         try:
-            if self.provider == "openrouter":
+            if provider == "openrouter":
                 content = payload["choices"][0]["message"]["content"]
+                finish_reason = payload["choices"][0].get("finish_reason")
+                if finish_reason == "length":
+                    raise TargetGenerationError(
+                        f"{provider.title()} response was truncated (finish_reason=length)."
+                    )
+            elif provider == "cloudflare":
+                if not payload.get("success", False):
+                    errors = payload.get("errors", [])
+                    error_messages = "; ".join(
+                        e.get("message", str(e)) for e in errors
+                    ) if errors else "Unknown Cloudflare error"
+                    if "quota" in error_messages.casefold() or "allocation" in error_messages.casefold():
+                        raise GemmaQuotaExhausted(
+                            "Cloudflare Workers AI daily free allocation exhausted. "
+                            "Check your account quota at https://dash.cloudflare.com."
+                        )
+                    raise TargetGenerationError(
+                        f"Cloudflare API error: {error_messages}"
+                    )
+                result_choices = payload.get("result", {}).get("choices", [])
+                if not result_choices:
+                    raise TargetGenerationError(
+                        "Cloudflare response did not contain result choices."
+                    )
+                content = result_choices[0]["message"]["content"]
+                finish_reason = result_choices[0].get("finish_reason")
+                if finish_reason == "length":
+                    raise TargetGenerationError(
+                        f"Cloudflare response was truncated (finish_reason=length)."
+                    )
             else:
                 content = payload["message"]["content"]
         except (KeyError, TypeError):
             logger.warning(
                 "%s message content parse success=false game=%s attempt=%s",
-                self.provider,
+                provider,
                 game_id,
                 attempt,
             )
             raise TargetGenerationError(
-                f"{self.provider.title()} response did not contain message content."
+                f"{provider.title()} response did not contain message content."
             )
 
         if not isinstance(content, str):
             logger.warning(
                 "%s message content is not a string game=%s attempt=%s",
-                self.provider,
+                provider,
                 game_id,
                 attempt,
             )
             raise TargetGenerationError(
-                f"{self.provider.title()} message content was not text."
+                f"{provider.title()} message content was not text."
+            )
+
+        if not content.strip():
+            raise TargetGenerationError(
+                f"{provider.title()} returned empty message content."
             )
 
         diagnostic_document: Any = None
@@ -449,7 +734,7 @@ class GemmaTargetGenerator:
         )
         logger.info(
             "%s structured content game=%s attempt=%s field_parsed=true json_valid=%s top_level_keys=%s target_count=%s",
-            self.provider,
+            provider,
             game_id,
             attempt,
             json_valid,
@@ -469,7 +754,7 @@ class GemmaTargetGenerator:
             ]
             logger.warning(
                 "%s structured output validation failed game=%s attempt=%s reasons=%s",
-                self.provider,
+                provider,
                 game_id,
                 attempt,
                 reasons,
@@ -480,7 +765,7 @@ class GemmaTargetGenerator:
         except ValueError as exc:
             logger.warning(
                 "%s returned malformed JSON game=%s attempt=%s",
-                self.provider,
+                provider,
                 game_id,
                 attempt,
             )
@@ -490,6 +775,22 @@ class GemmaTargetGenerator:
                 "Gemma selected a class outside the ranked candidate list."
             )
         return result
+
+    @staticmethod
+    def _build_system_prompt(count: int) -> str:
+        return f"""You are the Game Master for an outdoor scavenger hunt. Your task is to select exactly {_target_count_text(count)} varied, realistically findable targets for a game session.
+
+Rules:
+- Return ONLY a JSON object with a "targets" array containing exactly {_target_count_text(count)} objects.
+- Each target object must have exactly two fields: "class_name" (string) and "hint" (string).
+- The "class_name" must be one of the allowed classes provided in the user prompt.
+- The "hint" must be a helpful, location-aware clue for finding the object in a public outdoor area.
+- Do not include any additional text, commentary, or formatting outside the JSON object.
+- Do not use synonyms or invented class names; the class_name must exactly match an allowed detector class.
+- Targets must be distinct (no duplicate class_names).
+- Targets must be safe, legal, and findable from public areas without trespassing or approaching traffic.
+- Hints should reference the general environment type or nearby features when available, but never claim exact object presence.
+"""
 
     @staticmethod
     def _build_prompt(
