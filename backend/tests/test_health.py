@@ -116,3 +116,72 @@ def test_ai_health_does_not_expose_endpoint_credentials(monkeypatch):
 
     assert response.json()["ollama_reachable"] is False
     assert "secret" not in response.text
+
+
+def test_openrouter_ai_health_requires_api_key(monkeypatch):
+    monkeypatch.setattr(settings, "AI_PROVIDER", "openrouter")
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "")
+    monkeypatch.setattr(
+        settings,
+        "OPENROUTER_MODEL",
+        "google/gemma-4-26b-a4b-it:free",
+    )
+
+    response = client.get("/api/health/ai")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "provider": "openrouter",
+        "reachable": False,
+        "model": "google/gemma-4-26b-a4b-it:free",
+        "model_available": False,
+        "detail": "OpenRouter is selected but OPENROUTER_API_KEY is not configured.",
+    }
+
+
+def test_openrouter_ai_health_does_not_expose_api_key(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {"id": "google/gemma-4-26b-a4b-it:free"},
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def get(self, url, headers):
+            assert url == "https://openrouter.ai/api/v1/models"
+            assert headers == {"Authorization": "Bearer test-secret"}
+            return FakeResponse()
+
+    monkeypatch.setattr(settings, "AI_PROVIDER", "openrouter")
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "test-secret")
+    monkeypatch.setattr(
+        settings,
+        "OPENROUTER_MODEL",
+        "google/gemma-4-26b-a4b-it:free",
+    )
+    monkeypatch.setattr("app.main.httpx.AsyncClient", FakeClient)
+
+    response = client.get("/api/health/ai")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "provider": "openrouter",
+        "reachable": True,
+        "model": "google/gemma-4-26b-a4b-it:free",
+        "model_available": True,
+    }
+    assert "test-secret" not in response.text

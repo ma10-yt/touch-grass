@@ -77,6 +77,10 @@ class GemmaModelUnavailable(TargetGenerationError):
     pass
 
 
+class GemmaRateLimited(TargetGenerationError):
+    pass
+
+
 class GemmaTarget(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -121,9 +125,15 @@ class GemmaTargetList(BaseModel):
 
 class GemmaTargetGenerator:
     def __init__(self) -> None:
-        self.model = settings.GEMMA_MODEL
-        self.base_url = settings.OLLAMA_URL.rstrip("/")
-        self.url = f"{self.base_url}/api/chat"
+        self.provider = settings.AI_PROVIDER
+        if self.provider == "openrouter":
+            self.model = settings.OPENROUTER_MODEL
+            self.base_url = settings.OPENROUTER_BASE_URL.rstrip("/")
+            self.url = f"{self.base_url}/chat/completions"
+        else:
+            self.model = settings.GEMMA_MODEL
+            self.base_url = settings.OLLAMA_URL.rstrip("/")
+            self.url = f"{self.base_url}/api/chat"
 
     async def generate_targets(
         self,
@@ -236,6 +246,8 @@ class GemmaTargetGenerator:
                 return targets
             except GemmaModelUnavailable:
                 raise
+            except GemmaRateLimited:
+                raise
             except TargetGenerationError as exc:
                 logger.warning(
                     "Structured Gemma attempt %s failed for game %s: %s",
@@ -245,9 +257,9 @@ class GemmaTargetGenerator:
                 )
                 if attempt == 1:
                     raise TargetGenerationError(
-                        f"Local Gemma target generation is unavailable or returned invalid output after two attempts: {exc}"
+                        f"{self.provider.title()} Gemma target generation is unavailable or returned invalid output after two attempts: {exc}"
                     ) from exc
-        raise TargetGenerationError("Local Gemma target generation failed.")
+        raise TargetGenerationError(f"{self.provider.title()} Gemma target generation failed.")
 
     @staticmethod
     def rank_candidates(
@@ -315,34 +327,61 @@ class GemmaTargetGenerator:
         allowed_classes: set[str],
         count: int = 5,
     ) -> GemmaTargetList:
+        if self.provider == "openrouter" and not settings.OPENROUTER_API_KEY:
+            raise GemmaModelUnavailable(
+                "OpenRouter is selected but OPENROUTER_API_KEY is not configured."
+            )
+        headers: dict[str, str] = {}
+        request_body: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "temperature": temperature,
+        }
+        if self.provider == "openrouter":
+            headers["Authorization"] = f"Bearer {settings.OPENROUTER_API_KEY}"
+            request_body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "gemma_target_list",
+                    "strict": True,
+                    "schema": schema,
+                },
+            }
+        else:
+            request_body["format"] = schema
+            request_body["options"] = {"temperature": temperature}
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
                 response = await client.post(
                     self.url,
-                    json={
-                        "model": self.model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "stream": False,
-                        "format": schema,
-                        "options": {"temperature": temperature},
-                    },
+                    json=request_body,
+                    headers=headers,
                 )
         except httpx.HTTPError as exc:
             logger.warning(
-                "Ollama chat request failed game=%s attempt=%s error_type=%s",
+                "%s chat request failed game=%s attempt=%s error_type=%s",
+                self.provider,
                 game_id,
                 attempt,
                 type(exc).__name__,
             )
-            raise TargetGenerationError("Could not connect to the local Ollama service.") from exc
+            raise TargetGenerationError(
+                f"Could not connect to the configured {self.provider} service."
+            ) from exc
 
         logger.info(
-            "Ollama chat response game=%s attempt=%s status=%s",
+            "%s chat response game=%s attempt=%s status=%s",
+            self.provider,
             game_id,
             attempt,
             response.status_code,
         )
-        if response.status_code == 404:
+        if self.provider == "openrouter" and response.status_code == 429:
+            raise GemmaRateLimited(
+                "OpenRouter rate limit or provider capacity was reached. Please try again later."
+            )
+        if self.provider == "ollama" and response.status_code == 404:
             try:
                 error_body = response.json()
                 error_text = str(error_body.get("error", ""))
@@ -359,27 +398,36 @@ class GemmaTargetGenerator:
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise TargetGenerationError(
-                f"Ollama returned HTTP {response.status_code} or invalid response JSON."
+                f"{self.provider.title()} returned HTTP {response.status_code} or invalid response JSON."
             ) from exc
 
         content: Any = None
         try:
-            content = payload["message"]["content"]
+            if self.provider == "openrouter":
+                content = payload["choices"][0]["message"]["content"]
+            else:
+                content = payload["message"]["content"]
         except (KeyError, TypeError):
             logger.warning(
-                "Ollama message content parse success=false game=%s attempt=%s",
+                "%s message content parse success=false game=%s attempt=%s",
+                self.provider,
                 game_id,
                 attempt,
             )
-            raise TargetGenerationError("Ollama response did not contain message.content.")
+            raise TargetGenerationError(
+                f"{self.provider.title()} response did not contain message content."
+            )
 
         if not isinstance(content, str):
             logger.warning(
-                "Ollama message content is not a string game=%s attempt=%s",
+                "%s message content is not a string game=%s attempt=%s",
+                self.provider,
                 game_id,
                 attempt,
             )
-            raise TargetGenerationError("Ollama message.content was not text.")
+            raise TargetGenerationError(
+                f"{self.provider.title()} message content was not text."
+            )
 
         diagnostic_document: Any = None
         json_valid = False
@@ -400,7 +448,8 @@ class GemmaTargetGenerator:
             else None
         )
         logger.info(
-            "Ollama structured content game=%s attempt=%s field_parsed=true json_valid=%s top_level_keys=%s target_count=%s",
+            "%s structured content game=%s attempt=%s field_parsed=true json_valid=%s top_level_keys=%s target_count=%s",
+            self.provider,
             game_id,
             attempt,
             json_valid,
@@ -419,7 +468,8 @@ class GemmaTargetGenerator:
                 for error in exc.errors(include_url=False)
             ]
             logger.warning(
-                "Ollama structured output validation failed game=%s attempt=%s reasons=%s",
+                "%s structured output validation failed game=%s attempt=%s reasons=%s",
+                self.provider,
                 game_id,
                 attempt,
                 reasons,
@@ -429,7 +479,8 @@ class GemmaTargetGenerator:
             ) from exc
         except ValueError as exc:
             logger.warning(
-                "Ollama returned malformed JSON game=%s attempt=%s",
+                "%s returned malformed JSON game=%s attempt=%s",
+                self.provider,
                 game_id,
                 attempt,
             )

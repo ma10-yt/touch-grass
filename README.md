@@ -69,6 +69,13 @@ Open-source AI is not an optional feature here; it is the game's intelligence.
    $env:RUN_YOLO_SMOKE_TEST = "1"
    python -m pytest backend/tests/test_yolo_smoke.py
    ```
+   To export and run the real ONNX Runtime smoke test used for the Render configuration:
+   ```powershell
+   pip install -r backend/requirements-render-export.txt
+   python -c "from ultralytics import YOLO; YOLO('yolov8n.pt').export(format='onnx', imgsz=640, dynamic=False, simplify=False)"
+   $env:RUN_YOLO_ONNX_SMOKE_TEST = "1"
+   python -m pytest backend/tests/test_yolo_onnx_smoke.py -q
+   ```
 
 5. **Run the Backend**
    From the project root:
@@ -84,39 +91,44 @@ Open-source AI is not an optional feature here; it is the game's intelligence.
 
 ## Deploy to Render
 
-The root [`render.yaml`](./render.yaml) Blueprint defines the public FastAPI web service and a separate private Ollama service. FastAPI continues to serve the existing `frontend/` directory; the Render health check uses the existing `/api/health` route. The Ollama service is private to the Render network, listens on port `11434`, and stores models on a persistent disk. Its startup entrypoint waits for Ollama, idempotently pulls `gemma3:1b`, and verifies the model before startup completes. The Dockerfile pins the official Ollama image to `0.40.2`.
+The root [`render.yaml`](./render.yaml) defines exactly one **public FastAPI web service on Render's Free plan**. There are no private services, Render databases, persistent disks, or paid add-ons. FastAPI serves the existing `frontend/` directory and `/api/health` is the health check. The service uses MongoDB Atlas for persistent games, OpenRouter for Gemma target generation, and CPU ONNX Runtime for genuine server-side YOLO image verification.
 
-### Resource and cost assumptions
+#### Resource limits and important caveat
 
-The Blueprint uses Render's currently documented compute plan IDs (October 2026; see [Render compute pricing](https://render.com/pricing#compute) and [persistent disk details](https://render.com/docs/disks)):
+Render documents its Free web service as **512 MB RAM**, which is a shared-CPU plan. Free services spin down after 15 minutes idle, take about a minute to cold-start, have ephemeral filesystems, and consume a shared **750 free instance-hours/month** per workspace. Free instances are documented as [unsuitable for production applications](https://render.com/docs/free). The ONNX deployment avoids importing PyTorch/Ultralytics at runtime; these are installed only during build to export the real YOLO weights, then removed. Uploaded images and the ONNX model file are ephemeral; games remain in Atlas and the model is regenerated during builds.
 
-- **FastAPI / YOLO:** `1c-2g` (1 CPU, 2 GB RAM), approximately **$25/month** at continuous operation. This is a paid plan because the Python/PyTorch/Ultralytics runtime and CPU inference need more headroom than a small/free instance; the service is configured for one Uvicorn worker to avoid duplicating the loaded detector in RAM.
-- **Ollama / Gemma:** `2c-4g` (2 CPU, 4 GB RAM), approximately **$85/month** at continuous operation. This gives the 1B model additional RAM for the model runtime and inference context while avoiding selecting a larger plan without workload measurements.
-- **Ollama model disk:** 5 GB at **$0.25/GB/month**, approximately **$1.25/month**. The 5 GB allocation leaves room for the model and its metadata.
+I measured the FastAPI app imported with ONNX Runtime loaded and ran two actual inferences locally, without importing Ultralytics/PyTorch at runtime. Peak process RSS was about **176 MB**. The `bus.jpg` inference returned bus class ID `5` at `0.836` confidence; `zidane.jpg` returned person class ID `0` at `0.822`. The corresponding PyTorch results with fixed 640×640 preprocessing were within about 0.01 confidence. This is a Windows/local measurement, not Render's Linux runtime, and excludes simultaneous requests and production traffic. It suggests a single-worker/single-inference process can fit 512 MB in this local test, but **Render's memory fit under load is not proven**; monitor memory and cold-start behavior, and expect possible OOM/restarts or slow CPU inference. Do not treat this as production reliability evidence.
 
-The estimated always-on Render total is **about $111.25/month**, before taxes, build-pipeline usage, data transfer, or MongoDB Atlas charges. Render bills compute prorated by runtime; confirm the plan and current total in the Blueprint review screen before applying. If observed memory or inference latency requires more capacity, resize only after measuring production-like load.
+#### Free Gemma API limits
 
-### Prepare services and secrets
+The Blueprint uses OpenRouter model `google/gemma-4-26b-a4b-it:free` (the current free Gemma variant found in the [OpenRouter model catalog](https://openrouter.ai/models), advertising `response_format`; it is not the local Gemma 3 1B model). OpenRouter's documented [free-variant limits](https://openrouter.ai/docs/api_reference/limits) are **20 requests/minute and 50 requests/day** when the account has purchased less than 10 credits. The 1,000/day tier requires at least 10 credits purchased and is outside a strict $0 budget. Generation can retry once after non-rate-limit errors, so worst case one fresh game start can use two requests; a daily cap of 50 therefore allows at most 25 such starts if each exhausts both attempts, before target changes or other API calls. HTTP 429 errors are returned without an immediate retry. Provider availability/capacity limits can also return 429s. Check the OpenRouter key usage endpoint/dashboard for current quota. Game creation/start requires Gemma; if the API key is missing or generation fails, the server returns an error and does **not** substitute fixed demo targets.
 
-1. Push this project to a Git provider repository yourself. The deployment workspace must contain a Git repository for Render to connect; the current local project directory has no `.git` metadata. No code is pushed or deployed automatically by this setup.
-2. Create/verify a MongoDB Atlas database and database user. Permit the Render web service's outbound IP ranges in Atlas Network Access; avoid opening the database to all IPs. Keep the Atlas URI out of source control.
-3. In Render, select **New → Blueprint**, connect the repository, and select the root `render.yaml`. Both services are placed in `oregon`; if you choose another supported region, set the same region for both services before applying.
-4. Review the displayed compute and disk charges. The Blueprint prompts for `MONGODB_URI` and `GEOCONTEXT_USER_AGENT`. Enter the Atlas URI securely in Render, and set the latter to an identifying value such as `TouchGrassGame/1.0 (contact: your-maintainer-email)`. Nominatim/OSM requests need an identifying User-Agent; respect the upstream usage policy and rates.
-5. Apply the Blueprint. The Ollama service becomes reachable only over Render's private network. The web service obtains its internal `host:port` through a Blueprint service reference; the app normalizes that to HTTP while retaining `http://localhost:11434` as the local default. The FastAPI build installs `backend/requirements.txt` and downloads/loads `yolov8n.pt` into the deploy artifact, rather than relying on a model file from the developer's machine.
-6. After deployment, open the web service URL over HTTPS. Confirm `/api/health` reports `status: ok` and `/api/health/ai` reports Ollama reachable with the model available. These endpoints do not validate MongoDB connectivity: test a real create/start flow after confirming that Atlas networking and credentials work. Then test GPS, camera capture, real target verification, voting, and multiplayer on devices with permissions enabled.
+#### Deployment steps (no billing setup)
+
+1. Push this project to a Git-provider repository yourself after checking that no `.env`, credentials, `.venv`, `.pt`, or generated `.onnx` files are tracked. The present project directory has no `.git` metadata; this setup does not push or deploy code for you.
+2. Create or select a MongoDB Atlas deployment, database user, and database. Configure Atlas network access for the Render web service; do not expose MongoDB broadly unless you accept that risk. Atlas may have costs independent of Render.
+3. Create a free OpenRouter account/key for free model use. Do not add paid credits if maintaining a strict $0 budget. Keep the key private.
+4. In Render, choose **New → Blueprint**, connect your repository, and select the root `render.yaml`. Verify the review contains one web service with plan `free` and no disk, private service, or paid database. Do not add a payment method or upgrade the plan.
+5. Set the prompted `MONGODB_URI`, `OPENROUTER_API_KEY`, and `GEOCONTEXT_USER_AGENT` in Render's secure environment-variable form. Use an identifying OSM User-Agent with a maintainer contact, for example `TouchGrassGame/1.0 (contact: your-maintainer-email)`. Follow Nominatim/Overpass usage policies.
+6. Apply the Blueprint. The build installs the app dependencies, downloads the actual `yolov8n.pt` weights through Ultralytics, exports ONNX at 640×640, then removes training/export-only PyTorch packages. Production serves the ONNX model with CPUExecutionProvider. No model weights from the local machine are required.
+7. Check `/api/health` and `/api/health/ai`; the latter confirms OpenRouter key connectivity/model listing but cannot guarantee free-model quota or provider availability. Test MongoDB game persistence and a real camera submission after deployment. Grant location and camera permissions over HTTPS; optional step counting remains browser-side.
 
 ### Environment variables
 
-The Blueprint sets production-specific values and asks for secrets through Render's secure dashboard prompt; no secrets are stored in this repository. Application settings recognized by `backend/app/config.py` are:
+The Blueprint sets production-specific values and asks for secrets through Render's secure dashboard prompt; no secret values belong in this repository. Application settings recognized by `backend/app/config.py` include:
 
 | Variable | Deployment value / default |
 | --- | --- |
 | `MONGODB_URI` | Required secret; set in Render to the Atlas connection URI. |
 | `MONGODB_DATABASE` | `touch_grass` |
 | `DEMO_MODE` | `false` (required for real Gemma and YOLO). |
-| `GEMMA_MODEL` | `gemma3:1b` |
-| `YOLO_MODEL` | `yolov8n.pt` (downloaded during the web service build). |
-| `OLLAMA_URL` | Render Blueprint reference to the private service `hostport`; local default remains `http://localhost:11434`. |
+| `AI_PROVIDER` | `openrouter` on Render; defaults to `ollama` locally. |
+| `OPENROUTER_API_KEY` | Required secret in Render; absent locally unless OpenRouter is selected. |
+| `OPENROUTER_MODEL` | `google/gemma-4-26b-a4b-it:free` |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` |
+| `GEMMA_MODEL` | `gemma3:1b` for local Ollama development. |
+| `OLLAMA_URL` | `http://localhost:11434` local default; unused by Render's OpenRouter provider. |
+| `YOLO_MODEL` | `yolov8n.onnx` on Render; local default `yolov8n.pt`. |
 | `GEOCONTEXT_USER_AGENT` | Required at deployment; set an app-identifying string with a maintainer contact. |
 | `LOCATION_MAX_AGE_SECONDS` | `60` |
 | `GPS_MAX_ACCURACY_METERS` | `250` |
@@ -142,7 +154,7 @@ The Blueprint sets production-specific values and asks for secrets through Rende
 | `GEOCONTEXT_REFRESH_STABILITY_METERS` | `150` |
 | `GEOCONTEXT_REFRESH_CONFIRMATIONS` | `2` |
 
-`PYTHON_VERSION=3.12.10` selects the Render Python build runtime. The separate Ollama container uses `OLLAMA_HOST=0.0.0.0:11434`; do not create a public Ollama web service or publish port `11434`.
+`PYTHON_VERSION=3.12.10` selects the Render Python build runtime. Production AI failures remain explicit; `DEMO_MODE` must stay `false`.
 
 ## Location context and movement
 - OpenStreetMap reverse-geocoding and nearby-feature endpoints are configurable with `GEOCONTEXT_PROVIDER`, `GEOCONTEXT_NOMINATIM_URL`, and `GEOCONTEXT_OVERPASS_URL`. The default provider makes one bounded nearby-feature query and one coarse reverse lookup, retries a failed request once, and caches successful results by a roughly 100 m location cell for six hours. Set a descriptive `GEOCONTEXT_USER_AGENT` when deploying, and follow the public provider's usage policy.

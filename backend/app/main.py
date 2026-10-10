@@ -71,6 +71,46 @@ async def health_check():
 
 @app.get("/api/health/ai")
 async def ai_health_check():
+    if settings.AI_PROVIDER == "openrouter":
+        if not settings.OPENROUTER_API_KEY:
+            return {
+                "provider": "openrouter",
+                "reachable": False,
+                "model": settings.OPENROUTER_MODEL,
+                "model_available": False,
+                "detail": "OpenRouter is selected but OPENROUTER_API_KEY is not configured.",
+            }
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
+                response = await client.get(
+                    f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/models",
+                    headers={
+                        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}"
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+            models = payload.get("data", []) if isinstance(payload, dict) else []
+            model_available = any(
+                isinstance(model, dict)
+                and model.get("id") == settings.OPENROUTER_MODEL
+                for model in models
+            )
+            return {
+                "provider": "openrouter",
+                "reachable": True,
+                "model": settings.OPENROUTER_MODEL,
+                "model_available": model_available,
+            }
+        except (httpx.HTTPError, ValueError):
+            return {
+                "provider": "openrouter",
+                "reachable": False,
+                "model": settings.OPENROUTER_MODEL,
+                "model_available": False,
+                "detail": "Could not connect to the configured OpenRouter service.",
+            }
+
     ollama_url = settings.OLLAMA_URL.rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:

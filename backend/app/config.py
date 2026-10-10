@@ -1,5 +1,6 @@
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
+from typing import Literal
 
 class Settings(BaseSettings):
     MONGODB_URI: str = "mongodb://localhost:27017"
@@ -15,6 +16,10 @@ class Settings(BaseSettings):
     GPS_MAX_SPEED_METERS_PER_SECOND: float = 12.0
     MAX_UPLOAD_MB: int = 10
     GEMMA_MODEL: str = "gemma3:1b"
+    AI_PROVIDER: Literal["ollama", "openrouter"] = "ollama"
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_MODEL: str = "google/gemma-4-26b-a4b-it:free"
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     YOLO_MODEL: str = "yolov8n.pt"
     YOLO_CONFIDENCE_THRESHOLD: float = Field(default=0.60, ge=0.0, le=1.0)
     TARGET_VOTE_INACTIVE_SECONDS: int = Field(default=90, ge=30)

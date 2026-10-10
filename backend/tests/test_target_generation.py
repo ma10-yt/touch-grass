@@ -4,6 +4,7 @@ import pytest
 import httpx
 from app.ai.gemma_generator import (
     GemmaModelUnavailable,
+    GemmaRateLimited,
     GemmaTargetGenerator,
     GemmaTargetList,
     TargetGenerationError,
@@ -47,6 +48,20 @@ class FakeResponse:
                     json=self._payload,
                 ),
             )
+
+
+class FakeOpenRouterResponse(FakeResponse):
+    def __init__(self, content=None, *, status_code=200, error=None):
+        self.status_code = status_code
+        self.request = httpx.Request(
+            "POST",
+            "https://openrouter.ai/api/v1/chat/completions",
+        )
+        self._payload = (
+            {"error": {"message": error}}
+            if error is not None
+            else {"choices": [{"message": {"content": content}}]}
+        )
 
 
 class FakeOllamaClient:
@@ -434,6 +449,116 @@ async def test_model_generation_does_not_silently_fallback_when_ollama_is_down(m
         await GemmaTargetGenerator().generate_targets("game-no-fallback", context())
 
     assert len(FakeOllamaClient.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_openrouter_uses_secret_and_strict_json_schema(monkeypatch):
+    monkeypatch.setattr(settings, "DEMO_MODE", False)
+    monkeypatch.setattr(settings, "AI_PROVIDER", "openrouter")
+    monkeypatch.setattr(settings, "OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free")
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "test-secret")
+    FakeOllamaClient.responses = [
+        FakeOpenRouterResponse(
+            json.dumps(
+                {
+                    "targets": target_set(
+                        ["bicycle", "bench", "bird", "car", "backpack"]
+                    )
+                }
+            )
+        )
+    ]
+    FakeOllamaClient.requests = []
+    monkeypatch.setattr(
+        "app.ai.gemma_generator.httpx.AsyncClient",
+        FakeOllamaClient,
+    )
+
+    generator = GemmaTargetGenerator()
+    targets = await generator.generate_targets("openrouter-game", context())
+
+    request = FakeOllamaClient.requests[0]
+    assert request["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert request["kwargs"]["headers"] == {"Authorization": "Bearer test-secret"}
+    assert request["body"]["model"] == "google/gemma-4-26b-a4b-it:free"
+    assert request["body"]["stream"] is False
+    assert request["body"]["response_format"]["type"] == "json_schema"
+    schema = request["body"]["response_format"]["json_schema"]
+    assert schema["strict"] is True
+    assert schema["name"] == "gemma_target_list"
+    assert schema["schema"]["properties"]["targets"]["minItems"] == 5
+    assert schema["schema"]["properties"]["targets"]["maxItems"] == 5
+    assert set(
+        schema["schema"]["$defs"]["GemmaTarget"]["properties"]["class_name"]["enum"]
+    ) <= set(OUTDOOR_CANDIDATE_CLASSES)
+    assert len(targets) == 5
+    assert "test-secret" not in repr(request["body"])
+
+
+@pytest.mark.asyncio
+async def test_openrouter_requires_key_and_does_not_fall_back(monkeypatch):
+    monkeypatch.setattr(settings, "DEMO_MODE", False)
+    monkeypatch.setattr(settings, "AI_PROVIDER", "openrouter")
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "")
+    FakeOllamaClient.requests = []
+    monkeypatch.setattr(
+        "app.ai.gemma_generator.httpx.AsyncClient",
+        FakeOllamaClient,
+    )
+
+    generator = GemmaTargetGenerator()
+
+    with pytest.raises(TargetGenerationError, match="OPENROUTER_API_KEY"):
+        await generator.generate_targets("openrouter-no-key", context())
+
+    assert FakeOllamaClient.requests == []
+
+
+@pytest.mark.asyncio
+async def test_openrouter_unavailable_does_not_return_demo_targets(monkeypatch):
+    monkeypatch.setattr(settings, "DEMO_MODE", False)
+    monkeypatch.setattr(settings, "AI_PROVIDER", "openrouter")
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "test-secret")
+    FakeOllamaClient.responses = [
+        httpx.ConnectError("offline"),
+        httpx.ConnectError("offline"),
+    ]
+    FakeOllamaClient.requests = []
+    monkeypatch.setattr(
+        "app.ai.gemma_generator.httpx.AsyncClient",
+        FakeOllamaClient,
+    )
+
+    with pytest.raises(TargetGenerationError, match="Openrouter"):
+        await GemmaTargetGenerator().generate_targets(
+            "openrouter-offline",
+            context(),
+        )
+
+    assert len(FakeOllamaClient.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_openrouter_rate_limit_fails_without_immediate_retry(monkeypatch):
+    monkeypatch.setattr(settings, "DEMO_MODE", False)
+    monkeypatch.setattr(settings, "AI_PROVIDER", "openrouter")
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "test-secret")
+    FakeOllamaClient.responses = [
+        FakeOpenRouterResponse(status_code=429, error="rate limit"),
+    ]
+    FakeOllamaClient.requests = []
+    monkeypatch.setattr(
+        "app.ai.gemma_generator.httpx.AsyncClient",
+        FakeOllamaClient,
+    )
+
+    with pytest.raises(GemmaRateLimited, match="rate limit"):
+        await GemmaTargetGenerator().generate_targets(
+            "openrouter-rate-limit",
+            context(),
+        )
+
+    assert len(FakeOllamaClient.requests) == 1
 
 
 @pytest.mark.asyncio
