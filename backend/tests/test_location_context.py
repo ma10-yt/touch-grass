@@ -65,8 +65,8 @@ async def test_resolve_uses_coarse_coordinates_and_categories(monkeypatch):
 
     assert len(clients[0].requests) == 2
     reverse_params = clients[0].requests[0][2]
-    assert reverse_params["lat"] == 43.653
-    assert reverse_params["lon"] == -79.383
+    assert reverse_params["lat"] == 43.6532
+    assert reverse_params["lon"] == -79.3832
     assert context.locality == "Toronto"
     assert context.region == "Ontario"
     assert context.environment_type == "urban"

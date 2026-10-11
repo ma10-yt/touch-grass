@@ -33,9 +33,9 @@ class Settings(BaseSettings):
     GEOCONTEXT_NOMINATIM_URL: str = "https://nominatim.openstreetmap.org/reverse"
     GEOCONTEXT_OVERPASS_URL: str = "https://overpass-api.de/api/interpreter"
     GEOCONTEXT_RADIUS_METERS: int = 1200
-    GEOCONTEXT_TIMEOUT_SECONDS: float = 5.0
-    GEOCONTEXT_RETRIES: int = 1
-    GEOCONTEXT_CACHE_TTL_SECONDS: int = 21600
+    GEOCONTEXT_TIMEOUT_SECONDS: float = 10.0
+    GEOCONTEXT_RETRIES: int = 2
+    GEOCONTEXT_CACHE_TTL_SECONDS: int = 1800
     GEOCONTEXT_REFRESH_DISTANCE_METERS: float = 200.0
     GEOCONTEXT_REFRESH_COOLDOWN_SECONDS: int = 60
     GEOCONTEXT_REFRESH_STABILITY_METERS: float = 150.0

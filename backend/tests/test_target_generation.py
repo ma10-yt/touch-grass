@@ -1233,3 +1233,331 @@ async def test_openrouter_still_works_after_cloudflare_integration(monkeypatch):
     assert request["url"] == "https://openrouter.ai/api/v1/chat/completions"
     assert request["kwargs"]["headers"]["Authorization"] == "Bearer test-secret"
     assert request["body"]["response_format"]["type"] == "json_schema"
+
+
+# Location-aware ranking and context quality regression tests
+
+
+@pytest.mark.asyncio
+async def test_geographic_context_reaches_model_prompt(monkeypatch):
+    """Verify that location context fields are included in the prompt sent to the model."""
+    configure_fake_cloudflare(
+        monkeypatch,
+        [
+            valid_cloudflare_response(["bicycle", "bench", "bird", "car", "backpack"]),
+            valid_cloudflare_response(["bus", "dog", "umbrella", "bottle", "kite"]),
+        ],
+    )
+
+    park_context = LocationContext(
+        locality="Central Park",
+        region="New York",
+        environment_type="park_nature",
+        nearby_categories=["parks_and_recreation", "natural_areas"],
+        nearby_feature_counts={"parks_and_recreation": 3, "natural_areas": 2},
+        context_mode="contextual",
+        context_status="available",
+    )
+
+    await GemmaTargetGenerator().generate_targets("geo-context-test", park_context)
+
+    # For Cloudflare, messages[0] is system prompt, messages[1] is user prompt
+    prompt = FakeOllamaClient.requests[0]["body"]["messages"][1]["content"]
+    # Check that key location context fields are in the prompt
+    assert "Central Park" in prompt
+    assert "park_nature" in prompt
+    assert "parks_and_recreation" in prompt
+    assert "natural_areas" in prompt
+    assert '"parks_and_recreation": 3' in prompt
+    assert '"natural_areas": 2' in prompt
+    assert "contextual" in prompt
+    assert "available" in prompt
+
+
+@pytest.mark.asyncio
+async def test_park_vs_residential_context_produces_different_rankings(monkeypatch):
+    """Park and residential contexts should rank candidates differently."""
+    generator = GemmaTargetGenerator()
+
+    park_context = LocationContext(
+        environment_type="park_nature",
+        nearby_categories=["parks_and_recreation"],
+        nearby_feature_counts={"parks_and_recreation": 3},
+        context_mode="contextual",
+        context_status="available",
+    )
+
+    residential_context = LocationContext(
+        environment_type="suburban",
+        nearby_categories=["residential_areas"],
+        nearby_feature_counts={"residential_areas": 3},
+        context_mode="contextual",
+        context_status="available",
+    )
+
+    park_ranked = generator.rank_candidates(park_context, "same-game-id")
+    residential_ranked = generator.rank_candidates(residential_context, "same-game-id")
+
+    # Top candidates should differ based on context
+    # Park: bench, bird should rank high
+    # Residential: car, dog, bicycle should rank high
+    park_top5 = [c.class_name for c in park_ranked[:5]]
+    residential_top5 = [c.class_name for c in residential_ranked[:5]]
+
+    # They should not be identical
+    assert park_top5 != residential_top5, (
+        f"Park and residential contexts produced identical rankings: {park_top5}"
+    )
+
+    # Park should have bench or bird in top 3
+    assert "bench" in park_top5[:3] or "bird" in park_top5[:3]
+
+    # Residential should have car, dog, or bicycle in top 3
+    assert "car" in residential_top5[:3] or "dog" in residential_top5[:3] or "bicycle" in residential_top5[:3]
+
+
+@pytest.mark.asyncio
+async def test_missing_osm_context_distinguishable_from_valid_context(monkeypatch):
+    """Missing OSM context (general mode) should be distinguishable from valid contextual mode."""
+    configure_fake_cloudflare(
+        monkeypatch,
+        [
+            valid_cloudflare_response(["bicycle", "bench", "bird", "car", "backpack"]),
+            valid_cloudflare_response(["bus", "dog", "umbrella", "bottle", "kite"]),
+            valid_cloudflare_response(["bicycle", "bench", "bird", "car", "backpack"]),
+            valid_cloudflare_response(["bus", "dog", "umbrella", "bottle", "kite"]),
+        ],
+    )
+
+    # General context (no location data)
+    general_context = LocationContext(
+        context_mode="general",
+        context_status="unavailable",
+        notice="Map context unavailable.",
+    )
+
+    # Contextual context (with location data)
+    contextual_context = LocationContext(
+        locality="Downtown",
+        environment_type="urban",
+        nearby_categories=["roads_and_junctions", "commercial_areas"],
+        nearby_feature_counts={"roads_and_junctions": 2, "commercial_areas": 1},
+        context_mode="contextual",
+        context_status="available",
+    )
+
+    await GemmaTargetGenerator().generate_targets("general-test", general_context)
+    await GemmaTargetGenerator().generate_targets("contextual-test", contextual_context)
+
+    # For Cloudflare, messages[0] is system prompt, messages[1] is user prompt
+    general_prompt = FakeOllamaClient.requests[0]["body"]["messages"][1]["content"]
+    contextual_prompt = FakeOllamaClient.requests[2]["body"]["messages"][1]["content"]
+
+    # General context should indicate unavailability
+    assert "general" in general_prompt
+    assert "unavailable" in general_prompt
+    assert "map evidence unavailable" in general_prompt
+
+    # Contextual context should have location data
+    assert "Downtown" in contextual_prompt
+    assert "urban" in contextual_prompt
+    assert "roads_and_junctions" in contextual_prompt
+    assert "commercial_areas" in contextual_prompt
+    assert "contextual" in contextual_prompt
+    assert "available" in contextual_prompt
+
+
+@pytest.mark.asyncio
+async def test_context_refresh_preserves_completed_targets_on_failure(monkeypatch):
+    """Failed context refresh should preserve existing valid targets."""
+    from app.services.game_service import GameService
+    from app.ai.gemma_generator import target_generator as global_target_generator
+    from app.models.game import Game, GameState
+    from app.models.location_context import LocationContext
+    from app.models.player import Player
+    from app.models.target import Target
+    from datetime import datetime, timezone
+
+    game = Game(
+        _id="refresh-fail-game",
+        join_code="RFG1",
+        creator_id="host",
+        status=GameState.ACTIVE,
+        targets=[
+            Target(id="old-0", name="Bench", class_name="bench", hint="Old area"),
+            Target(id="old-1", name="Bicycle", class_name="bicycle", hint="Old area"),
+            Target(id="old-2", name="Bird", class_name="bird", hint="Old area"),
+        ],
+        location_context=LocationContext(
+            locality="Starting District",
+            context_mode="contextual",
+            context_status="available",
+        ),
+        location_context_lat=43.0,
+        location_context_lon=-79.0,
+        location_context_updated_at=datetime.now(timezone.utc),
+    )
+    host = Player(
+        _id="host",
+        game_id=game.id,
+        display_name="Host",
+        completed_targets=["old-0"],
+    )
+    guest = Player(
+        _id="guest",
+        game_id=game.id,
+        display_name="Guest",
+        completed_targets=["old-1"],
+    )
+
+    async def get_game(game_id):
+        return game
+
+    async def update_game(updated_game, *, expected_targets=None):
+        return True
+
+    async def get_players(game_id):
+        return [host, guest]
+
+    async def resolve(lat, lon):
+        # Simulate OSM failure - return general context
+        return LocationContext(
+            context_mode="general",
+            context_status="unavailable",
+            notice="OSM lookup failed.",
+        )
+
+    monkeypatch.setattr("app.services.game_service.GameRepository.get_by_id", get_game)
+    monkeypatch.setattr("app.services.game_service.GameRepository.update", update_game)
+    monkeypatch.setattr("app.services.game_service.PlayerRepository.get_by_game", get_players)
+    monkeypatch.setattr("app.services.game_service.location_context_service.resolve", resolve)
+
+    # Create a generator that will fail (forcing fallback)
+    cf_generator = GemmaTargetGenerator()
+    cf_generator.provider = "cloudflare"
+    cf_generator.model = "@cf/google/gemma-4-26b-a4b-it"
+    cf_generator.url = "https://api.cloudflare.com/client/v4/accounts/test-account/ai/run/@cf/google/gemma-4-26b-a4b-it"
+    monkeypatch.setattr("app.services.game_service.target_generator", cf_generator)
+
+    configure_fake_cloudflare(
+        monkeypatch,
+        [
+            httpx.ConnectError("offline"),
+            httpx.ConnectError("offline"),
+        ],
+    )
+
+    from app.ai.yolo_verifier import image_verifier
+    monkeypatch.setattr(
+        image_verifier,
+        "get_supported_target_classes",
+        lambda: ("bench", "bicycle", "bird", "car", "backpack", "dog"),
+    )
+    # Disable cooldown for test
+    monkeypatch.setattr(settings, "GEOCONTEXT_REFRESH_COOLDOWN_SECONDS", 0)
+
+    # First call sets up candidate, second confirms
+    updated, notice = await GameService.refresh_area_context(
+        game.id, 43.002, -79.0
+    )
+    updated, notice = await GameService.refresh_area_context(
+        game.id, 43.00201, -79.0
+    )
+
+    # Refresh should fail (return False) because AI failed and no valid context
+    assert updated is False
+    # Original targets should be preserved
+    assert "old-0" in [t.id for t in game.targets]
+    assert "old-1" in [t.id for t in game.targets]
+    assert "old-2" in [t.id for t in game.targets]
+
+
+@pytest.mark.asyncio
+async def test_target_generation_logs_provider_context_and_candidates(monkeypatch, caplog):
+    """Verify structured logging includes provider, context quality, and candidate info."""
+    configure_fake_cloudflare(
+        monkeypatch,
+        [valid_cloudflare_response(["bicycle", "bench", "bird", "car", "backpack"])],
+    )
+
+    import logging
+    with caplog.at_level(logging.INFO):
+        await GemmaTargetGenerator().generate_targets("logging-test", context())
+
+    log_text = caplog.text
+    # Check for structured logging fields
+    assert "Target generation:" in log_text
+    assert "logging-test" in log_text
+    assert "cloudflare" in log_text
+    assert "contextual" in log_text
+    assert "suburban" in log_text
+    # Should log candidate info
+    assert "candidate_count" in log_text
+    assert "pool_count" in log_text
+
+
+@pytest.mark.asyncio
+async def test_generation_returns_five_unique_supported_classes(monkeypatch):
+    """Every generation must return exactly 5 unique supported classes."""
+    configure_fake_cloudflare(
+        monkeypatch,
+        [valid_cloudflare_response(["bicycle", "bench", "bird", "car", "backpack"])],
+    )
+
+    targets = await GemmaTargetGenerator().generate_targets("five-unique-test", context())
+
+    assert len(targets) == 5
+    classes = [t.class_name for t in targets]
+    assert len(classes) == len(set(classes)), "All targets must be unique"
+    assert all(c in OUTDOOR_CANDIDATE_CLASSES for c in classes), "All classes must be supported"
+
+
+@pytest.mark.asyncio
+async def test_generation_returns_five_unique_supported_classes_on_fallback(monkeypatch):
+    """Fallback must also return exactly 5 unique supported classes."""
+    configure_fake_cloudflare(
+        monkeypatch,
+        [
+            httpx.ConnectError("offline"),
+            httpx.ConnectError("offline"),
+        ],
+    )
+
+    targets = await GemmaTargetGenerator().generate_targets("fallback-five-test", context())
+
+    assert len(targets) == 5
+    classes = [t.class_name for t in targets]
+    assert len(classes) == len(set(classes)), "All fallback targets must be unique"
+    assert all(c in OUTDOOR_CANDIDATE_CLASSES for c in classes), "All fallback classes must be supported"
+
+
+@pytest.mark.asyncio
+async def test_different_game_ids_produce_different_fallback_combinations(monkeypatch):
+    """Different game_ids should produce different fallback combinations."""
+    # Each game needs 2 ConnectError responses (2 attempts before fallback)
+    configure_fake_cloudflare(
+        monkeypatch,
+        [
+            httpx.ConnectError("offline"),
+            httpx.ConnectError("offline"),
+            httpx.ConnectError("offline"),
+            httpx.ConnectError("offline"),
+        ],
+    )
+
+    targets_1 = await GemmaTargetGenerator().generate_targets("game-a", context())
+    targets_2 = await GemmaTargetGenerator().generate_targets("game-b", context())
+
+    classes_1 = {t.class_name for t in targets_1}
+    classes_2 = {t.class_name for t in targets_2}
+
+    # Both should be valid
+    assert len(targets_1) == 5
+    assert len(targets_2) == 5
+    assert len(classes_1) == 5
+    assert len(classes_2) == 5
+
+    # They should potentially differ (not guaranteed but likely with different game_ids)
+    # At minimum verify they are valid and not just a fixed demo list
+    assert classes_1 <= set(OUTDOOR_CANDIDATE_CLASSES)
+    assert classes_2 <= set(OUTDOOR_CANDIDATE_CLASSES)

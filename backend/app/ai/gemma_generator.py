@@ -224,12 +224,25 @@ class GemmaTargetGenerator:
             )
         candidates = [candidate.class_name for candidate in candidate_pool]
         logger.info(
-            "Ranked target candidates game=%s mode=%s environment=%s categories=%s candidates=%s",
+            "Target generation: game=%s provider=%s mode=%s environment=%s categories=%s "
+            "candidate_count=%d pool_count=%d excluded=%s supported=%d",
             game_id,
+            self.provider,
             context.context_mode,
             context.environment_type,
             context.nearby_categories,
-            [candidate.model_dump() for candidate in ranked_candidates],
+            len(ranked_candidates),
+            len(candidate_pool),
+            sorted(excluded),
+            len(supported),
+        )
+        logger.debug(
+            "Target generation: top candidates game=%s candidates=%s",
+            game_id,
+            [
+                {"class": c.class_name, "score": c.score, "reasons": c.reasons}
+                for c in ranked_candidates[:10]
+            ],
         )
         schema = GemmaTargetList.model_json_schema()
         schema["$defs"]["GemmaTarget"]["properties"]["class_name"]["enum"] = candidates
@@ -278,10 +291,15 @@ class GemmaTargetGenerator:
                         for item in structured_targets.targets
                     ]
                     logger.info(
-                        "Gemma selected target classes game=%s provider=%s targets=%s",
+                        "Target generation: SUCCESS game=%s provider=%s attempt=%d targets=%s "
+                        "context_mode=%s environment=%s categories=%s",
                         game_id,
                         provider,
+                        attempt + 1,
                         [target.class_name for target in targets],
+                        context.context_mode,
+                        context.environment_type,
+                        context.nearby_categories,
                     )
                     return targets
                 except GemmaQuotaExhausted as exc:
@@ -352,11 +370,14 @@ class GemmaTargetGenerator:
 
         failure_types = sorted({type(error).__name__ for _, error in provider_failures})
         logger.warning(
-            "AI target generation unavailable; using supported location-ranked "
-            "targets game=%s failed_providers=%s failure_types=%s",
+            "Target generation: FALLBACK game=%s failed_providers=%s failure_types=%s "
+            "context_mode=%s environment=%s categories=%s",
             game_id,
             [provider for provider, _ in provider_failures],
             failure_types,
+            context.context_mode,
+            context.environment_type,
+            context.nearby_categories,
         )
         fallback_targets = self._build_ranked_fallback_targets(candidate_pool, count, game_id)
         if len(fallback_targets) != count:
@@ -370,9 +391,13 @@ class GemmaTargetGenerator:
         )
         context.notice = f"{context.notice} {notice}".strip()
         logger.info(
-            "Location-ranked fallback targets game=%s targets=%s",
+            "Target generation: FALLBACK targets game=%s targets=%s context_mode=%s "
+            "environment=%s categories=%s",
             game_id,
             [target.class_name for target in fallback_targets],
+            context.context_mode,
+            context.environment_type,
+            context.nearby_categories,
         )
         return fallback_targets
 
@@ -398,6 +423,15 @@ class GemmaTargetGenerator:
         # We'll select from the top tier with variation based on game_id
         scored_candidates = [(c.score, c) for c in candidates]
         scored_candidates.sort(key=lambda x: (-x[0], hashlib.sha256(f"{game_id}:{x[1].class_name}".encode()).hexdigest()))
+
+        logger.debug(
+            "Fallback selection: game=%s scored_candidates=%s",
+            game_id,
+            [
+                {"class": c.class_name, "score": score, "reasons": c.reasons}
+                for score, c in scored_candidates
+            ],
+        )
 
         # Take top candidates, but if there are ties in score, use game_id to vary selection
         targets: list[Target] = []
@@ -425,6 +459,11 @@ class GemmaTargetGenerator:
             )
             selected_classes.add(candidate.class_name)
 
+        logger.debug(
+            "Fallback selection: game=%s selected=%s",
+            game_id,
+            [{"class": t.class_name, "hint": t.hint} for t in targets],
+        )
         return targets
 
     @staticmethod
@@ -791,6 +830,7 @@ Rules:
 - Targets must be distinct (no duplicate class_names).
 - Targets must be safe, legal, and findable from public areas without trespassing or approaching traffic.
 - Hints should reference the general environment type or nearby features when available, but never claim exact object presence.
+- STRONGLY PREFER targets that are appropriate for the described environment and nearby features. For example, in a park setting, prefer benches, birds, frisbees, sports balls; in urban/road settings, prefer cars, buses, traffic lights, bicycles; in residential areas, prefer cars, dogs, bicycles. Do not select targets that are mismatched to the surroundings (e.g., do not select "bench" in a highway area, or "traffic light" in a nature reserve).
 """
 
     @staticmethod
@@ -822,13 +862,27 @@ Rules:
             " Every displayed name must identify exactly its detector class; never "
             "use a synonym or a visually similar unsupported object."
         )
+        # Add explicit location-awareness instruction
+        location_instruction = ""
+        if context.context_mode == "contextual" and context.nearby_categories:
+            location_instruction = (
+                f"\n\nIMPORTANT: This game is in a {context.environment_type.replace('_', ' ')} area "
+                f"with nearby features: {', '.join(context.nearby_categories)}. "
+                f"Prioritize targets that are commonly found in this type of environment. "
+                f"Use the candidate scores and reasons as guidance for which objects are most appropriate."
+            )
+        elif context.context_mode == "general":
+            location_instruction = (
+                "\n\nNOTE: Specific location context is unavailable. Choose broadly accessible "
+                "outdoor targets that are common in general public areas."
+            )
         return f"""
 You are the Game Master for an outdoor scavenger hunt. Create {_target_count_text(count)} varied,
 realistically findable targets for this game session: {game_id}.
 Use the coarse, non-coordinate location context below to adapt targets and hints.
 If the context is unavailable or partial, say nothing that implies you know exact
 nearby places and choose broadly accessible outdoor targets.
-Location context: {json.dumps(coarse_context, ensure_ascii=True)}
+Location context: {json.dumps(coarse_context, ensure_ascii=True)}{location_instruction}
 
 Choose {_target_count_text(count)} distinct object classes from this location-ranked supported-class list.
 Prefer candidates with stronger map-evidence scores, but do not claim an object is

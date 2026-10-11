@@ -15,22 +15,36 @@ class LocationContextService:
     def __init__(self):
         self._nominatim_lock = asyncio.Lock()
         self._last_nominatim_request = 0.0
+        self._last_lat: float = 0.0
+        self._last_lon: float = 0.0
         self._cache: dict[tuple[float, float], tuple[float, LocationContext]] = {}
 
     async def resolve(self, lat: Optional[float], lon: Optional[float]) -> LocationContext:
         if lat is None or lon is None:
+            logger.info(
+                "Location context: no coordinates provided; using general context"
+            )
             return self._general_context(
                 "A recent accurate location was unavailable; targets use general outdoor context."
             )
 
-        coarse_lat = round(lat, 3)
-        coarse_lon = round(lon, 3)
+        # Use 4 decimal places (~11m) for cache key to avoid stale context for nearby movement
+        coarse_lat = round(lat, 4)
+        coarse_lon = round(lon, 4)
         cache_key = (coarse_lat, coarse_lon)
         cached = self._cache.get(cache_key)
         if cached and time.monotonic() - cached[0] < settings.GEOCONTEXT_CACHE_TTL_SECONDS:
+            logger.info(
+                "Location context: cache hit lat=%.4f lon=%.4f",
+                coarse_lat,
+                coarse_lon,
+            )
             return cached[1].model_copy(deep=True)
 
         if settings.GEOCONTEXT_PROVIDER.casefold() != "openstreetmap":
+            logger.warning(
+                "Location context: provider not openstreetmap; using general context"
+            )
             return self._general_context(
                 "The configured geographical context provider is unavailable; targets use general outdoor context."
             )
@@ -50,6 +64,11 @@ class LocationContextService:
             )
 
         if reverse_data is None and feature_data is None:
+            logger.warning(
+                "Location context: both OSM lookups failed lat=%.4f lon=%.4f; using general context",
+                coarse_lat,
+                coarse_lon,
+            )
             return self._general_context(
                 "Nearby geographical data is unavailable; targets use general outdoor context."
             )
@@ -84,6 +103,17 @@ class LocationContextService:
                 else "Only limited map context was available; targets use broad outdoor context."
             ),
         )
+        logger.info(
+            "Location context: resolved lat=%.4f lon=%.4f mode=%s status=%s env=%s locality=%s categories=%s counts=%s",
+            coarse_lat,
+            coarse_lon,
+            context.context_mode,
+            context.context_status,
+            context.environment_type,
+            context.locality,
+            context.nearby_categories,
+            context.nearby_feature_counts,
+        )
         if context.context_status != "unavailable":
             if len(self._cache) >= 256:
                 expired = [
@@ -103,21 +133,40 @@ class LocationContextService:
     async def _retry_lookup(self, name: str, lookup):
         for attempt in range(settings.GEOCONTEXT_RETRIES + 1):
             try:
-                return await lookup()
+                result = await lookup()
+                if result is not None:
+                    logger.info(
+                        "Location context: %s lookup succeeded lat=%.4f lon=%.4f attempt=%d",
+                        name,
+                        self._last_lat if hasattr(self, '_last_lat') else 0,
+                        self._last_lon if hasattr(self, '_last_lon') else 0,
+                        attempt + 1,
+                    )
+                return result
             except (httpx.HTTPError, ValueError, TypeError) as exc:
                 logger.warning(
-                    "OpenStreetMap %s lookup failed attempt=%s error_type=%s",
+                    "OpenStreetMap %s lookup failed lat=%.4f lon=%.4f attempt=%d error_type=%s",
                     name,
+                    self._last_lat if hasattr(self, '_last_lat') else 0,
+                    self._last_lon if hasattr(self, '_last_lon') else 0,
                     attempt + 1,
                     type(exc).__name__,
                 )
                 if attempt < settings.GEOCONTEXT_RETRIES:
                     await asyncio.sleep(0.25 * (attempt + 1))
+        logger.error(
+            "Location context: %s lookup exhausted retries lat=%.4f lon=%.4f",
+            name,
+            self._last_lat if hasattr(self, '_last_lat') else 0,
+            self._last_lon if hasattr(self, '_last_lon') else 0,
+        )
         return None
 
     async def _reverse_geocode(
         self, client: httpx.AsyncClient, lat: float, lon: float
     ) -> dict[str, Any]:
+        self._last_lat = lat
+        self._last_lon = lon
         async with self._nominatim_lock:
             wait_seconds = 1.0 - (time.monotonic() - self._last_nominatim_request)
             if wait_seconds > 0:
@@ -144,6 +193,8 @@ class LocationContextService:
     async def _nearby_features(
         self, client: httpx.AsyncClient, lat: float, lon: float
     ) -> dict[str, Any]:
+        self._last_lat = lat
+        self._last_lon = lon
         response = await client.post(
             settings.GEOCONTEXT_OVERPASS_URL,
             data={"data": self._overpass_query(lat, lon)},
